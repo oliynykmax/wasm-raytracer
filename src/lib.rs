@@ -7,6 +7,7 @@
 use core::f32::consts::PI;
 use core::ops::{Add, Mul, Neg, Sub};
 
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct V {
     x: f32,
@@ -109,11 +110,13 @@ struct Obj {
 }
 
 #[derive(Clone, Copy, Default)]
+/// 32 bytes, laid out to match the WGSL `Node` struct so the GPU can use this BVH as is.
+#[repr(C)]
 struct Node {
     bmin: V,
-    bmax: V,
-    // Interior: index of left child (right is left + 1). Leaf: first item.
+    // Interior: index of left child (right is left + 1). Leaf: first item in ORDER.
     first: u32,
+    bmax: V,
     count: u32,
 }
 
@@ -134,6 +137,23 @@ pub extern "C" fn scene_ptr() -> *mut f32 {
 #[no_mangle]
 pub extern "C" fn max_objects() -> u32 {
     MAX_OBJ as u32
+}
+
+/// BVH built by `set_scene`, exported so the WebGPU renderer can upload it.
+#[no_mangle]
+pub extern "C" fn bvh_nodes_ptr() -> *const u32 {
+    unsafe { NODES.as_ptr() as *const u32 }
+}
+
+#[no_mangle]
+pub extern "C" fn bvh_nodes_len() -> u32 {
+    unsafe { NODES.len() as u32 }
+}
+
+/// Object indices in leaf order.
+#[no_mangle]
+pub extern "C" fn bvh_order_ptr() -> *const u32 {
+    unsafe { ORDER.as_ptr() }
 }
 
 #[no_mangle]
@@ -472,6 +492,16 @@ fn sky(d: V, specular: bool) -> V {
     c
 }
 
+/// Integer hash (lowbias32) for decorrelated per-pixel seeds.
+fn hashu(x: u32) -> u32 {
+    let mut h = x;
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x7feb352d);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x846ca68b);
+    h ^ (h >> 16)
+}
+
 struct Rng(u32);
 impl Rng {
     #[inline]
@@ -701,12 +731,15 @@ pub extern "C" fn render(
             let y = row0 as usize + ri * step as usize;
             for x in 0..w as usize {
                 let idx = ri * w as usize + x;
-                let mut rng = Rng((y as u32 * 9781 + x as u32 * 6271) ^ frame.wrapping_mul(26699) ^ 0x9e3779b9);
-                rng.f();
+                let mut rng = Rng(hashu((y as u32 * w + x as u32) ^ hashu(frame.wrapping_mul(0x9e3779b9).wrapping_add(17))));
                 let sx = ((x as f32 + rng.f()) / w as f32 * 2.0 - 1.0) * th * aspect;
                 let sy = (1.0 - (y as f32 + rng.f()) / h as f32 * 2.0) * th;
                 let rd = (fwd + right * sx + up * sy).norm();
-                let c = trace(eye, rd, &mut rng, &mut first);
+                let mut c = trace(eye, rd, &mut rng, &mut first);
+                // One NaN would live forever in the reprojected history; drop it.
+                if !(c.x.is_finite() && c.y.is_finite() && c.z.is_finite()) {
+                    c = V::default();
+                }
                 OUT[idx * 8..idx * 8 + 8].copy_from_slice(&[c.x, c.y, c.z, 0.0, first.0.x, first.0.y, first.0.z, first.1]);
             }
         }

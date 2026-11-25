@@ -93,6 +93,19 @@ document.body.classList.toggle('touch', isTouch);
 // ---------- State ----------
 const cam = { p: [0, 2.3, 10.5], yaw: 0, pitch: -0.12, fov: 70 * Math.PI / 180 };
 let scene = defaultScene();
+// ?stress=N adds N blocks and orbs on a deterministic layout, for benchmarking.
+const stressN = Math.min(400, +(new URLSearchParams(location.search).get('stress') || 0));
+function addStress(objs, n) {
+  let r = 12345;
+  const rnd = () => ((r = (r * 1103515245 + 12345) >>> 0) / 4294967296);
+  for (let i = 0; i < n; i++) {
+    const it = ITEMS[i % ITEMS.length];
+    const x = Math.floor(rnd() * 30) - 15 + 0.5, z = Math.floor(rnd() * 30) - 25 + 0.5, y = Math.floor(rnd() * 3) + 0.5;
+    objs.push(fromItem(it, [x, it.k === 0 && it.s < 0.5 ? y - 0.5 + it.s : y, z]));
+  }
+  return objs;
+}
+if (stressN) addStress(scene, stressN);
 let sceneVersion = 1;
 let selected = 0;
 let skyMode = 0;
@@ -104,9 +117,19 @@ const vert = { up: false, down: false };
 // ---------- WebAssembly ----------
 const res = await fetch('raytracer.wasm');
 const bytes = await res.arrayBuffer();
-const { instance } = await WebAssembly.instantiate(bytes, {});
-const W = instance.exports;
+// Compile once; the main thread, the icon renderer and every worker instantiate this module.
+const wasmModule = await WebAssembly.compile(bytes);
+const W = (await WebAssembly.instantiate(wasmModule, {})).exports;
 const MAX_OBJ = W.max_objects();
+
+// The BVH the wasm just built for the main-thread scene, for the GPU to reuse.
+function wasmBvh() {
+  const n = W.bvh_nodes_len();
+  return {
+    nodes: new Uint8Array(W.memory.buffer, W.bvh_nodes_ptr(), n * 32).slice(),
+    order: new Uint32Array(W.memory.buffer, W.bvh_order_ptr(), scene.length).slice(),
+  };
+}
 
 function uploadMain(packed, count) {
   new Float32Array(W.memory.buffer, W.scene_ptr(), packed.length).set(packed);
@@ -127,10 +150,13 @@ function tone(x) {
   return GAMMA[a <= 0 ? 0 : a >= 1 ? 4096 : (a * 4096) | 0];
 }
 
+// Icons use their own instance so they never disturb the scene used for picking.
+const IW = (await WebAssembly.instantiate(wasmModule, {})).exports;
 function renderIcon(it) {
-  const size = 64, spp = 48;
+  const size = 64, spp = 32;
   const packed = packScene([fromItem(it, [0, it.s, 0])]);
-  uploadMain(packed, 1);
+  new Float32Array(IW.memory.buffer, IW.scene_ptr(), packed.length).set(packed);
+  IW.set_scene(1);
   const eye = [1.25, 1.1, 1.45];
   const d = [0 - eye[0], it.s - eye[1], 0 - eye[2]];
   const len = Math.hypot(...d);
@@ -138,8 +164,8 @@ function renderIcon(it) {
   const pitch = Math.asin(d[1] / len);
   const acc = new Float32Array(size * size * 3);
   for (let f = 0; f < spp; f++) {
-    const ptr = W.render(size, size, 0, 1, f, eye[0], eye[1], eye[2], yaw, pitch, 0.75, 0);
-    const s = new Float32Array(W.memory.buffer, ptr, size * size * 8);
+    const ptr = IW.render(size, size, 0, 1, f, eye[0], eye[1], eye[2], yaw, pitch, 0.75, 0);
+    const s = new Float32Array(IW.memory.buffer, ptr, size * size * 8);
     for (let i = 0; i < size * size; i++) for (let k = 0; k < 3; k++) acc[i * 3 + k] += s[i * 8 + k];
   }
   const img = new ImageData(size, size);
@@ -156,7 +182,6 @@ ITEMS.forEach((it, i) => {
   const slot = document.createElement('button');
   slot.className = 'slot';
   slot.setAttribute('aria-label', it.name);
-  slot.appendChild(renderIcon(it));
   const n = document.createElement('span');
   n.className = 'num';
   n.textContent = i + 1;
@@ -164,6 +189,14 @@ ITEMS.forEach((it, i) => {
   slot.addEventListener('pointerdown', (e) => { e.stopPropagation(); select(i); });
   hotbar.appendChild(slot);
 });
+// Render icons one per task after the first frame instead of blocking startup.
+function renderIconsLater(i = 0) {
+  if (i >= ITEMS.length) return;
+  setTimeout(() => {
+    hotbar.children[i].prepend(renderIcon(ITEMS[i]));
+    renderIconsLater(i + 1);
+  }, i === 0 ? 300 : 30);
+}
 let nameTimer;
 function select(i) {
   selected = (i + ITEMS.length) % ITEMS.length;
@@ -179,7 +212,7 @@ select(0);
 function markDirty() {
   sceneVersion++;
   uploadMain(packScene(scene), scene.length);
-  gpu?.setScene(scene);
+  gpu?.setScene(scene, wasmBvh());
   resetAccum();
 }
 
@@ -229,7 +262,7 @@ await Promise.all(Array.from({ length: N }, () => new Promise((ok) => {
   const w = new Worker('worker.js');
   w.sent = 0;
   w.onmessage = (e) => { if (e.data.type === 'ready') { w.onmessage = onRows; ok(); } };
-  w.postMessage({ type: 'init', bytes: bytes.slice(0) });
+  w.postMessage({ type: 'init', module: wasmModule });
   workers.push(w);
 })));
 
@@ -251,6 +284,7 @@ const buf = document.createElement('canvas');
 const bctx = buf.getContext('2d');
 let img = null, samples = null, dispCam = null;
 let hist = null; // { w, h, color, n, pos, cam }
+const histPool = [];
 
 function resetAccum() { hist = null; gpu?.reset(); gpuSpp = 0; }
 
@@ -282,8 +316,15 @@ function onRows(e) {
 
 function resolve() {
   const w = rw, h = rh, n = w * h, c = dispCam;
-  const color = new Float32Array(n * 3), cnt = new Float32Array(n), pos = new Float32Array(n * 4);
   const H = hist;
+  // Two preallocated history sets: write into the one `hist` is not reading.
+  let set = histPool.find((b) => b !== H && b.w === w && b.h === h);
+  if (!set) {
+    const slot = histPool.findIndex((b) => b !== H);
+    set = { w, h, color: new Float32Array(n * 3), n: new Float32Array(n), pos: new Float32Array(n * 4), cam: null };
+    if (slot >= 0) histPool[slot] = set; else histPool.push(set);
+  }
+  const color = set.color, cnt = set.n, pos = set.pos;
   const cap = still ? 1e9 : MOVE_CAP;
   const upscale = H && H.w < w; // fresh hi-res frame: trust low-res history only a little
   const px = img.data;
@@ -336,7 +377,8 @@ function resolve() {
     pos[p4] = X; pos[p4 + 1] = Y; pos[p4 + 2] = Z; pos[p4 + 3] = hit;
     px[p4] = tone(color[o]); px[p4 + 1] = tone(color[o + 1]); px[p4 + 2] = tone(color[o + 2]); px[p4 + 3] = 255;
   }
-  hist = { w, h, color, n: cnt, pos, cam: c };
+  set.cam = c;
+  hist = set;
   centerSpp = cnt[(h >> 1) * w + (w >> 1)];
   if (buf.width !== w || buf.height !== h) { buf.width = w; buf.height = h; }
   bctx.putImageData(img, 0, 0);
@@ -412,7 +454,6 @@ try {
   gpuError = String(e.message || e);
   console.warn('WebGPU disabled:', e);
 }
-if (gpu) gpu.setScene(scene);
 let mode = gpu && !new URLSearchParams(location.search).has('cpu') ? 'gpu' : 'cpu';
 let gpuBusy = false, gpuScale = 0.6, gpuSppPerFrame = 1, gpuMoveSpp = 1, gpuSpp = 0, gpuFrame = 0, gpuW = 0, gpuH = 0;
 const GPU_MAX_SPP = 16384;
@@ -648,7 +689,7 @@ function tick(now) {
   if (keys.has('ShiftLeft') || keys.has('ShiftRight') || keys.has('KeyC') || vert.down) u -= 1;
   f -= joy.y; r += joy.x;
   if (f || r || u) {
-    const speed = (keys.has('ControlLeft') ? 12 : 4.5) * dt;
+    const speed = (keys.has('KeyF') ? 12 : 4.5) * dt;
     for (let i = 0; i < 3; i++) cam.p[i] += (flat[i] * f + right[i] * r) * speed;
     cam.p[1] = Math.max(0.15, cam.p[1] + u * speed);
     lastMove = now;
@@ -665,3 +706,4 @@ setMode(mode);
 markDirty();
 $('loading').remove();
 requestAnimationFrame(tick);
+renderIconsLater();

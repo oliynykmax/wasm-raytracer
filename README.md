@@ -14,7 +14,7 @@ A real-time path tracer you can fly through and build in, running entirely on yo
 
 | Desktop | Phone |
 |---|---|
-| Click to start, WASD fly, Space/Shift up/down, Ctrl faster | Left thumb joystick, drag to look |
+| Click to start, WASD fly, Space/Shift up/down, hold F faster | Left thumb joystick, drag to look |
 | Left click place, right click break, 1–9 or wheel picks an item | Tap a slot, **+** place, **−** break |
 | G GPU/CPU · T sky · R reset · H hide panel | GPU, ☀ and ↺ buttons |
 

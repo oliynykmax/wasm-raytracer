@@ -3,6 +3,11 @@
 // CPU compositor in main.js).
 
 struct Obj { a: vec4f, b: vec4f, c: vec4f, d: vec4f }
+// BVH built by the wasm, flattened by gpu.js into depth-first order for a
+// stackless walk: on a box hit go to the next node, on a miss jump to `skip`.
+// `leaf` = object count << 24 | first object (0 for interior nodes; objects are
+// uploaded in leaf order). Node 0's `skip` is the node count.
+struct Node { bmin: vec3f, leaf: u32, bmax: vec3f, skip: u32 }
 // a: kind, cx, cy, cz   b: sx, sy, sz, mat   c: r, g, b, rough   d: ior, emit, -, -
 
 struct U {
@@ -21,6 +26,7 @@ struct U {
 @group(0) @binding(4) var<storage, read> posIn: array<vec4f>;
 @group(0) @binding(5) var<storage, read_write> histOut: array<vec4f>;
 @group(0) @binding(6) var<storage, read_write> posOut: array<vec4f>;
+@group(0) @binding(7) var<storage, read> nodes: array<Node>;
 
 const EPS: f32 = 1e-3;
 const PI: f32 = 3.14159265;
@@ -88,6 +94,19 @@ fn hitObj(i: u32, ro: vec3f, rd: vec3f, inv: vec3f, tmax: f32) -> vec4f {
 
 struct Hit { t: f32, n: vec3f, id: i32 }
 
+const MISS: f32 = 1e31;
+
+fn boxEntry(lo: vec3f, hi: vec3f, ro: vec3f, inv: vec3f, tmax: f32) -> f32 {
+  let t1 = (lo - ro) * inv;
+  let t2 = (hi - ro) * inv;
+  let mn = min(t1, t2);
+  let mx = max(t1, t2);
+  let tn = max(max(mn.x, mn.y), mn.z);
+  let tf = min(min(mx.x, mx.y), mx.z);
+  if (tf >= max(tn, 0.0) && tn < tmax) { return tn; }
+  return MISS;
+}
+
 fn intersect(ro: vec3f, rd: vec3f) -> Hit {
   var h = Hit(1e30, vec3f(0.0, 1.0, 0.0), -2);
   if (abs(rd.y) > 1e-7) {
@@ -97,10 +116,20 @@ fn intersect(ro: vec3f, rd: vec3f) -> Hit {
       h.n = vec3f(0.0, select(-1.0, 1.0, ro.y >= 0.0), 0.0);
     }
   }
+  if (u.misc.z == 0u) { return h; }
   let inv = safeInv(rd);
-  for (var i = 0u; i < u.misc.z; i++) {
-    let r = hitObj(i, ro, rd, inv, h.t);
-    if (r.x > 0.0) { h.t = r.x; h.n = r.yzw; h.id = i32(i); }
+  let end = nodes[0].skip;
+  var i = 0u;
+  while (i < end) {
+    let n = nodes[i];
+    if (boxEntry(n.bmin, n.bmax, ro, inv, h.t) == MISS) { i = n.skip; continue; }
+    let first = n.leaf & 0xffffffu;
+    let last = first + (n.leaf >> 24u);
+    for (var k = first; k < last; k++) {
+      let r = hitObj(k, ro, rd, inv, h.t);
+      if (r.x > 0.0) { h.t = r.x; h.n = r.yzw; h.id = i32(k); }
+    }
+    i += 1u;
   }
   return h;
 }
@@ -109,13 +138,23 @@ fn intersect(ro: vec3f, rd: vec3f) -> Hit {
 fn occlusion(ro: vec3f, rd: vec3f, tmax: f32, skip: i32) -> vec3f {
   if (rd.y < 0.0 && ro.y > 0.0 && -ro.y / rd.y < tmax) { return vec3f(0.0); }
   var tr = vec3f(1.0);
+  if (u.misc.z == 0u) { return tr; }
   let inv = safeInv(rd);
-  for (var i = 0u; i < u.misc.z; i++) {
-    if (i32(i) == skip) { continue; }
-    if (hitObj(i, ro, rd, inv, tmax).x > 0.0) {
-      let o = objs[i];
-      if (u32(o.b.w) == GLASS) { tr *= o.c.xyz * 0.85; } else { return vec3f(0.0); }
+  let end = nodes[0].skip;
+  var i = 0u;
+  while (i < end) {
+    let n = nodes[i];
+    if (boxEntry(n.bmin, n.bmax, ro, inv, tmax) == MISS) { i = n.skip; continue; }
+    let first = n.leaf & 0xffffffu;
+    let last = first + (n.leaf >> 24u);
+    for (var k = first; k < last; k++) {
+      if (i32(k) == skip) { continue; }
+      if (hitObj(k, ro, rd, inv, tmax).x > 0.0) {
+        let o = objs[k];
+        if (u32(o.b.w) == GLASS) { tr *= o.c.xyz * 0.85; } else { return vec3f(0.0); }
+      }
     }
+    i += 1u;
   }
   return tr;
 }
@@ -206,6 +245,9 @@ fn direct(p: vec3f, n: vec3f) -> vec3f {
   }
   return c;
 }
+
+// NaN/Inf test on the bits: compilers may fold `x != x` away under fast math.
+fn isBad(x: f32) -> bool { return (bitcast<u32>(x) & 0x7f800000u) == 0x7f800000u; }
 
 fn reflectV(d: vec3f, n: vec3f) -> vec3f { return d - n * (2.0 * dot(d, n)); }
 
@@ -314,6 +356,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3u) {
     if (s == 0u) { first = firstHit; }
   }
   col /= f32(spp);
+  // One NaN would live forever in the reprojected history; drop it.
+  if (isBad(col.x) || isBad(col.y) || isBad(col.z)) { col = vec3f(0.0); }
 
   // Reproject into the previous frame and blend with the history found there.
   var prevN = 0.0;

@@ -4,7 +4,7 @@ let wasm, mem, objCount = 0;
 self.onmessage = async (e) => {
   const m = e.data;
   if (m.type === 'init') {
-    const { instance } = await WebAssembly.instantiate(m.bytes, {});
+    const instance = await WebAssembly.instantiate(m.module, {});
     wasm = instance.exports;
     mem = wasm.memory;
     self.postMessage({ type: 'ready' });

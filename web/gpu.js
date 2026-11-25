@@ -44,6 +44,25 @@ for (const s of SKIES) {
   s.sun = s.sun.map((x) => x / l);
 }
 
+// Flatten the wasm BVH (children at first, first + 1) into depth-first order with
+// skip links so the shader can walk it without a stack.
+function threadBvh(raw) {
+  const f = new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
+  const u = new Uint32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
+  const outF = new Float32Array(f.length), outU = new Uint32Array(outF.buffer);
+  let next = 0;
+  (function emit(i) {
+    const o = next++ * 8, s = i * 8;
+    outF.set(f.subarray(s, s + 3), o);
+    outF.set(f.subarray(s + 4, s + 7), o + 4);
+    const first = u[s + 3], count = u[s + 7];
+    if (count > 0) outU[o + 3] = (count << 24) | first;
+    else { outU[o + 3] = 0; emit(first); emit(first + 1); }
+    outU[o + 7] = next; // skip: first node after this subtree
+  })(0);
+  return outF;
+}
+
 export async function createGpu(canvas, { maxObjects, onLost }) {
   if (!navigator.gpu) return null;
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
@@ -74,6 +93,7 @@ export async function createGpu(canvas, { maxObjects, onLost }) {
   const dUniform = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const objBuf = device.createBuffer({ size: Math.max(1, maxObjects) * 64, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
   const lightBuf = device.createBuffer({ size: Math.max(1, maxObjects) * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const nodeBuf = device.createBuffer({ size: (2 * Math.max(1, maxObjects) + 1) * 32, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
   let objCount = 0, lightCount = 0;
 
   let cap = 0; // pixels the history buffers can hold
@@ -98,6 +118,7 @@ export async function createGpu(canvas, { maxObjects, onLost }) {
         { binding: 4, resource: { buffer: pos[i] } },
         { binding: 5, resource: { buffer: hist[1 - i] } },
         { binding: 6, resource: { buffer: pos[1 - i] } },
+        { binding: 7, resource: { buffer: nodeBuf } },
       ],
     }));
     dgroups = [0, 1].map((i) => device.createBindGroup({
@@ -107,14 +128,17 @@ export async function createGpu(canvas, { maxObjects, onLost }) {
     prev = null;
   }
 
-  function setScene(objs) {
+  /** `bvh` comes from the wasm (`nodes`: raw 32-byte nodes, `order`: object index per leaf slot). */
+  function setScene(objs, bvh) {
     const f = new Float32Array(Math.max(1, objs.length) * 16);
     const lights = [];
-    objs.forEach((o, i) => {
-      f.set([o.k, ...o.p, ...o.s, o.m, ...o.c, o.rough, o.ior, o.e, 0, 0], i * 16);
-      if (o.m === 3 && o.k === 0) lights.push(i);
-    });
+    for (let slot = 0; slot < objs.length; slot++) {
+      const o = objs[bvh.order[slot]];
+      f.set([o.k, ...o.p, ...o.s, o.m, ...o.c, o.rough, o.ior, o.e, 0, 0], slot * 16);
+      if (o.m === 3 && o.k === 0) lights.push(slot);
+    }
     device.queue.writeBuffer(objBuf, 0, f);
+    device.queue.writeBuffer(nodeBuf, 0, threadBvh(bvh.nodes));
     if (lights.length) device.queue.writeBuffer(lightBuf, 0, new Uint32Array(lights));
     objCount = objs.length;
     lightCount = lights.length;
