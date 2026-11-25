@@ -373,7 +373,7 @@ function sizeDisplay() {
 
 let sentVersion = new Map();
 function maybeDispatch() {
-  if (inflight > 0) return;
+  if (inflight > 0 || document.hidden) return; // never burn CPU in a background tab
   if (still && centerSpp >= maxSpp) return;
   sizeDisplay();
   const [w, h] = wantedSize();
