@@ -1,4 +1,5 @@
 // Host side: input, scene editing, worker pool and compositing.
+import { createGpu } from './gpu.js';
 // All pixels come from the Rust path tracer compiled to WebAssembly.
 
 const SPHERE = 0, BOX = 1;
@@ -178,6 +179,7 @@ select(0);
 function markDirty() {
   sceneVersion++;
   uploadMain(packScene(scene), scene.length);
+  gpu?.setScene(scene);
   resetAccum();
 }
 
@@ -250,7 +252,7 @@ const bctx = buf.getContext('2d');
 let img = null, samples = null, dispCam = null;
 let hist = null; // { w, h, color, n, pos, cam }
 
-function resetAccum() { hist = null; }
+function resetAccum() { hist = null; gpu?.reset(); gpuSpp = 0; }
 
 function camSnapshot(w, h) {
   const b = basis();
@@ -373,7 +375,7 @@ function sizeDisplay() {
 
 let sentVersion = new Map();
 function maybeDispatch() {
-  if (inflight > 0 || document.hidden) return; // never burn CPU in a background tab
+  if (mode !== 'cpu' || inflight > 0 || document.hidden) return; // never burn CPU in a background tab
   if (still && centerSpp >= maxSpp) return;
   sizeDisplay();
   const [w, h] = wantedSize();
@@ -400,13 +402,70 @@ function maybeDispatch() {
   });
 }
 
+// ---------- WebGPU backend ----------
+const gpuCanvas = $('gpuview');
+let gpu = null, gpuError = '';
+try {
+  gpu = await createGpu(gpuCanvas, { maxObjects: MAX_OBJ, onLost: (m) => { gpuError = m; gpu = null; setMode('cpu'); } });
+  if (!gpu) gpuError = 'WebGPU not available';
+} catch (e) {
+  gpuError = String(e.message || e);
+  console.warn('WebGPU disabled:', e);
+}
+if (gpu) gpu.setScene(scene);
+let mode = gpu && !new URLSearchParams(location.search).has('cpu') ? 'gpu' : 'cpu';
+let gpuBusy = false, gpuScale = 0.6, gpuSppPerFrame = 1, gpuMoveSpp = 1, gpuSpp = 0, gpuFrame = 0, gpuW = 0, gpuH = 0;
+const GPU_MAX_SPP = 16384;
+
+function setMode(m) {
+  if (m === 'gpu' && !gpu) { toast(gpuError || 'WebGPU not available'); m = 'cpu'; }
+  mode = m;
+  document.body.dataset.mode = m;
+  canvas.style.opacity = m === 'gpu' ? '0' : '1';
+  resetAccum();
+  $('backend').textContent = m === 'gpu' ? `WebGPU · ${gpu.name}` : `CPU wasm · ${N} workers`;
+}
+
+function gpuTick() {
+  if (!gpu || gpuBusy || document.hidden) return;
+  if (still && gpuSpp >= GPU_MAX_SPP) return;
+  const dpr = Math.min(devicePixelRatio || 1, 1.5);
+  const dw = Math.round(innerWidth * dpr), dh = Math.round(innerHeight * dpr);
+  if (gpuCanvas.width !== dw || gpuCanvas.height !== dh) { gpuCanvas.width = dw; gpuCanvas.height = dh; }
+  let s = still ? 1 : gpuScale;
+  if (dw * dh * s * s > 2.2e6) s = Math.sqrt(2.2e6 / (dw * dh));
+  const w = Math.max(32, Math.round(dw * s)), h = Math.max(24, Math.round(dh * s));
+  const spp = still ? gpuSppPerFrame : gpuMoveSpp;
+  const b = basis();
+  const camS = { eye: [...cam.p], ...b, th: Math.tan(cam.fov / 2), aspect: w / h };
+  gpuBusy = true;
+  const t0 = performance.now();
+  gpu.frame({ cam: camS, w, h, spp, historyCap: still ? 1e9 : 12, sky: skyMode, exposure, frameIndex: gpuFrame++ }).then(() => {
+    const ms = performance.now() - t0;
+    gpuBusy = false;
+    gpuW = w; gpuH = h;
+    samplesWindow += w * h * spp;
+    fpsWindow++;
+    if (still) {
+      gpuSpp += spp;
+      if (ms < 28 && gpuSppPerFrame < 32) gpuSppPerFrame++;
+      else if (ms > 45 && gpuSppPerFrame > 1) gpuSppPerFrame--;
+    } else {
+      // One frame per display refresh: spend spare time on resolution first, then samples.
+      gpuSpp = Math.min(gpuSpp + spp, 12);
+      if (ms > 20) { if (gpuMoveSpp > 1) gpuMoveSpp--; else gpuScale = Math.max(0.3, gpuScale * 0.92); }
+      else if (ms < 10) { if (gpuScale < 1) gpuScale = Math.min(1, gpuScale * 1.05); else if (gpuMoveSpp < 8) gpuMoveSpp++; }
+    }
+  }, (e) => { gpuBusy = false; gpuError = String(e); setMode('cpu'); });
+}
+
 // ---------- Input ----------
 let started = false;
 const startEl = $('start');
 function start() {
   started = true;
   startEl.classList.add('hidden');
-  if (!isTouch && canvas.requestPointerLock) canvas.requestPointerLock();
+  if (!isTouch && canvas.requestPointerLock) Promise.resolve(canvas.requestPointerLock()).catch(() => {});
 }
 startEl.addEventListener('click', start);
 document.addEventListener('pointerlockchange', () => {
@@ -419,6 +478,7 @@ addEventListener('keydown', (e) => {
   if (/^Digit[1-9]$/.test(e.code)) select(+e.code.slice(5) - 1);
   if (e.code === 'KeyT') { skyMode = (skyMode + 1) % 3; resetAccum(); toast(SKY_NAMES[skyMode]); }
   if (e.code === 'KeyH') $('hud').classList.toggle('hidden');
+  if (e.code === 'KeyG') { setMode(mode === 'gpu' ? 'cpu' : 'gpu'); toast(mode === 'gpu' ? 'GPU (WebGPU)' : 'CPU (wasm)'); }
   if (e.code === 'KeyR') { scene = defaultScene(); markDirty(); toast('Scene reset'); }
   if (e.code === 'KeyQ') breakTarget();
   if (e.code === 'KeyE') place();
@@ -496,6 +556,7 @@ hold('btn-break', breakTarget);
 hold('btn-up', () => (vert.up = true), () => (vert.up = false));
 hold('btn-down', () => (vert.down = true), () => (vert.down = false));
 hold('btn-sky', () => { skyMode = (skyMode + 1) % 3; resetAccum(); toast(SKY_NAMES[skyMode]); });
+hold('btn-gpu', () => { setMode(mode === 'gpu' ? 'cpu' : 'gpu'); toast(mode === 'gpu' ? 'GPU (WebGPU)' : 'CPU (wasm)'); });
 hold('btn-reset', () => { scene = defaultScene(); markDirty(); toast('Scene reset'); });
 
 let toastTimer;
@@ -565,8 +626,10 @@ function updateStats(now) {
   samplesWindow = 0; fpsWindow = 0; statT = now;
   $('stats').textContent =
     `${fps.toFixed(1)} fps · ${(pathsPerSec / 1e6).toFixed(2)} M paths/s\n` +
-    `${rw}×${rh} · ${still ? 'still' : 'moving'} · ${Math.round(centerSpp)} spp\n` +
-    `${N} workers${arch ? ' · ' + arch : ''} · ${scene.length} objects · ${SKY_NAMES[skyMode]}`;
+    (mode === 'gpu'
+      ? `${gpuW}×${gpuH} · ${still ? 'still' : 'moving'} · ${Math.round(gpuSpp)} spp\n`
+      : `${rw}×${rh} · ${still ? 'still' : 'moving'} · ${Math.round(centerSpp)} spp\n`) +
+    `${arch ? arch + ' · ' : ''}${scene.length} objects · ${SKY_NAMES[skyMode]}`;
 }
 
 // ---------- Main loop ----------
@@ -592,11 +655,13 @@ function tick(now) {
   }
   const wasStill = still;
   still = now - lastMove > 220;
-  maybeDispatch();
+  if (still !== wasStill) gpuSpp = Math.min(gpuSpp, 12);
+  if (mode === 'gpu') gpuTick(); else maybeDispatch();
   drawGhost();
   updateStats(now);
   requestAnimationFrame(tick);
 }
+setMode(mode);
 markDirty();
 $('loading').remove();
 requestAnimationFrame(tick);
