@@ -86,7 +86,7 @@ const canvas = $('view');
 const ctx = canvas.getContext('2d');
 const overlay = $('overlay');
 const octx = overlay.getContext('2d');
-const isTouch = matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window;
+const isTouch = matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window || new URLSearchParams(location.search).has('touch');
 document.body.classList.toggle('touch', isTouch);
 
 // ---------- State ----------
@@ -117,8 +117,17 @@ const hash = [...new Uint8Array(hashBuf)].map((b) => b.toString(16).padStart(2, 
 
 // ---------- Hotbar with icons rendered by the same wasm ----------
 const hotbar = $('hotbar');
+// Linear HDR -> sRGB-ish byte via ACES and a gamma lookup table.
+const GAMMA = new Uint8ClampedArray(4097);
+for (let i = 0; i <= 4096; i++) GAMMA[i] = Math.round(Math.pow(i / 4096, 1 / 2.2) * 255);
+function tone(x) {
+  x *= exposure;
+  const a = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
+  return GAMMA[a <= 0 ? 0 : a >= 1 ? 4096 : (a * 4096) | 0];
+}
+
 function renderIcon(it) {
-  const size = 64;
+  const size = 64, spp = 48;
   const packed = packScene([fromItem(it, [0, it.s, 0])]);
   uploadMain(packed, 1);
   const eye = [1.25, 1.1, 1.45];
@@ -126,11 +135,17 @@ function renderIcon(it) {
   const len = Math.hypot(...d);
   const yaw = Math.atan2(d[0], -d[2]);
   const pitch = Math.asin(d[1] / len);
-  let ptr = 0;
-  for (let f = 0; f < 48; f++) {
-    ptr = W.render(size, size, 0, 1, f, 0, eye[0], eye[1], eye[2], yaw, pitch, 0.75, 0, 1.2);
+  const acc = new Float32Array(size * size * 3);
+  for (let f = 0; f < spp; f++) {
+    const ptr = W.render(size, size, 0, 1, f, eye[0], eye[1], eye[2], yaw, pitch, 0.75, 0);
+    const s = new Float32Array(W.memory.buffer, ptr, size * size * 8);
+    for (let i = 0; i < size * size; i++) for (let k = 0; k < 3; k++) acc[i * 3 + k] += s[i * 8 + k];
   }
-  const img = new ImageData(new Uint8ClampedArray(W.memory.buffer, ptr, size * size * 4).slice(), size, size);
+  const img = new ImageData(size, size);
+  for (let i = 0; i < size * size; i++) {
+    for (let k = 0; k < 3; k++) img.data[i * 4 + k] = tone((acc[i * 3 + k] / spp) * 1.2);
+    img.data[i * 4 + 3] = 255;
+  }
   const c = document.createElement('canvas');
   c.width = c.height = size;
   c.getContext('2d').putImageData(img, 0, 0);
@@ -216,31 +231,117 @@ await Promise.all(Array.from({ length: N }, () => new Promise((ok) => {
   workers.push(w);
 })));
 
-let frame = 0, inflight = 0, frameId = 0, img = null, rw = 0, rh = 0;
+// ---------- Frame pipeline with temporal reprojection ----------
+// Workers return one fresh sample per pixel plus where its primary ray hit.
+// Each pixel looks up where that point was on the previous frame and blends with
+// the history found there, so moving keeps most of the accumulated samples and
+// the displayed canvas is only ever replaced by a finished frame (no blank frames).
+let frame = 0, inflight = 0, frameId = 0, rw = 0, rh = 0;
 let moveScale = isTouch ? 0.3 : 0.4;
 let lastMove = 0, still = false, lastDispatch = 0, lastFrameMs = 0;
 let samplesWindow = 0, fpsWindow = 0, statT = performance.now(), pathsPerSec = 0, fps = 0;
-const maxSpp = 4096;
+let throughput = 0; // smoothed paths per second, used to size still frames
+let centerSpp = 0;
+const maxSpp = 8192;
+const MOVE_CAP = 10; // history length while moving: less noise, little smearing
 
-function resetAccum() { frame = 0; }
+const buf = document.createElement('canvas');
+const bctx = buf.getContext('2d');
+let img = null, samples = null, dispCam = null;
+let hist = null; // { w, h, color, n, pos, cam }
+
+function resetAccum() { hist = null; }
+
+function camSnapshot(w, h) {
+  const b = basis();
+  return { eye: [...cam.p], ...b, th: Math.tan(cam.fov / 2), aspect: w / h };
+}
 
 function onRows(e) {
   const m = e.data;
-  if (m.id !== frameId || !img) { inflight--; maybeDispatch(); return; }
-  const rowBytes = rw * 4;
-  const dst = img.data;
-  for (let i = 0, y = m.row0; y < rh; i++, y += m.step) {
-    dst.set(m.px.subarray(i * rowBytes, (i + 1) * rowBytes), y * rowBytes);
-  }
   inflight--;
+  if (m.id !== frameId) { if (inflight === 0) maybeDispatch(); return; }
+  const rowF = rw * 8;
+  for (let i = 0, y = m.row0; y < rh; i++, y += m.step) {
+    samples.set(m.px.subarray(i * rowF, (i + 1) * rowF), y * rowF);
+  }
   if (inflight === 0) {
-    ctx.putImageData(img, 0, 0);
+    resolve();
     lastFrameMs = performance.now() - lastDispatch;
+    const pps = (rw * rh) / (lastFrameMs / 1000);
+    throughput = throughput ? throughput * 0.8 + pps * 0.2 : pps;
     samplesWindow += rw * rh;
     fpsWindow++;
     frame++;
     adapt();
+    maybeDispatch(); // start the next frame now instead of waiting for rAF
   }
+}
+
+function resolve() {
+  const w = rw, h = rh, n = w * h, c = dispCam;
+  const color = new Float32Array(n * 3), cnt = new Float32Array(n), pos = new Float32Array(n * 4);
+  const H = hist;
+  const cap = still ? 1e9 : MOVE_CAP;
+  const upscale = H && H.w < w; // fresh hi-res frame: trust low-res history only a little
+  const px = img.data;
+  let hx0 = 0, hy0 = 0, hz0 = 0, hfx = 0, hfy = 0, hfz = 0, hrx = 0, hry = 0, hrz = 0, hux = 0, huy = 0, huz = 0, hsx = 1, hsy = 1;
+  if (H) {
+    const p = H.cam;
+    [hx0, hy0, hz0] = p.eye; [hfx, hfy, hfz] = p.fwd; [hrx, hry, hrz] = p.right; [hux, huy, huz] = p.up;
+    hsx = 1 / (p.th * p.aspect); hsy = 1 / p.th;
+  }
+  const ex = c.eye[0], ey = c.eye[1], ez = c.eye[2];
+  for (let i = 0; i < n; i++) {
+    const s = i * 8;
+    const r = samples[s], g = samples[s + 1], b = samples[s + 2];
+    const X = samples[s + 4], Y = samples[s + 5], Z = samples[s + 6], hit = samples[s + 7];
+    let prevN = 0, j = -1;
+    if (H) {
+      let dx, dy, dz;
+      if (hit) { dx = X - hx0; dy = Y - hy0; dz = Z - hz0; } else { dx = X; dy = Y; dz = Z; }
+      const z = dx * hfx + dy * hfy + dz * hfz;
+      if (z > 1e-4) {
+        const sx = ((dx * hrx + dy * hry + dz * hrz) / z) * hsx;
+        const sy = ((dx * hux + dy * huy + dz * huz) / z) * hsy;
+        const qx = Math.floor((sx + 1) * 0.5 * H.w), qy = Math.floor((1 - sy) * 0.5 * H.h);
+        if (qx >= 0 && qy >= 0 && qx < H.w && qy < H.h) {
+          j = qy * H.w + qx;
+          const hp = j * 4;
+          if (hit) {
+            if (H.pos[hp + 3]) {
+              const ddx = H.pos[hp] - X, ddy = H.pos[hp + 1] - Y, ddz = H.pos[hp + 2] - Z;
+              const vx = X - ex, vy = Y - ey, vz = Z - ez;
+              const tol = 0.035 * 0.035 * (vx * vx + vy * vy + vz * vz) + 1e-4;
+              if (ddx * ddx + ddy * ddy + ddz * ddz < tol) prevN = H.n[j];
+            }
+          } else if (!H.pos[hp + 3]) prevN = H.n[j];
+        }
+      }
+    }
+    if (upscale && prevN > 2) prevN = 2;
+    let k = prevN + 1;
+    if (k > cap) k = cap;
+    const o = i * 3;
+    if (prevN > 0) {
+      const t = 1 / k, q = j * 3;
+      color[o] = H.color[q] + (r - H.color[q]) * t;
+      color[o + 1] = H.color[q + 1] + (g - H.color[q + 1]) * t;
+      color[o + 2] = H.color[q + 2] + (b - H.color[q + 2]) * t;
+    } else { color[o] = r; color[o + 1] = g; color[o + 2] = b; k = 1; }
+    cnt[i] = k;
+    const p4 = i * 4;
+    pos[p4] = X; pos[p4 + 1] = Y; pos[p4 + 2] = Z; pos[p4 + 3] = hit;
+    px[p4] = tone(color[o]); px[p4 + 1] = tone(color[o + 1]); px[p4 + 2] = tone(color[o + 2]); px[p4 + 3] = 255;
+  }
+  hist = { w, h, color, n: cnt, pos, cam: c };
+  centerSpp = cnt[(h >> 1) * w + (w >> 1)];
+  if (buf.width !== w || buf.height !== h) { buf.width = w; buf.height = h; }
+  bctx.putImageData(img, 0, 0);
+  const dw = canvas.width, dh = canvas.height;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(buf, 0, 0, dw, dh);
 }
 
 function adapt() {
@@ -251,30 +352,43 @@ function adapt() {
 
 function wantedSize() {
   const cw = innerWidth, ch = innerHeight;
-  let s = still ? 1 : moveScale;
-  const maxPx = still ? 1.4e6 : 6e5;
-  if (cw * ch * s * s > maxPx) s = Math.sqrt(maxPx / (cw * ch));
+  let s = moveScale;
+  if (still) {
+    // Keep each still frame short (~0.2 s) so motion can resume immediately.
+    const budget = Math.max(1.5e5, Math.min(1.4e6, throughput * 0.2));
+    s = Math.min(1, Math.sqrt(budget / (cw * ch)));
+    s = Math.max(s, moveScale);
+  }
   return [Math.max(32, Math.round(cw * s)), Math.max(24, Math.round(ch * s))];
+}
+
+function sizeDisplay() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const dw = Math.round(innerWidth * dpr), dh = Math.round(innerHeight * dpr);
+  if (canvas.width !== dw || canvas.height !== dh) {
+    canvas.width = dw; canvas.height = dh;
+    if (buf.width > 1) ctx.drawImage(buf, 0, 0, dw, dh);
+  }
 }
 
 let sentVersion = new Map();
 function maybeDispatch() {
   if (inflight > 0) return;
-  if (still && frame >= maxSpp) return;
+  if (still && centerSpp >= maxSpp) return;
+  sizeDisplay();
   const [w, h] = wantedSize();
   if (w !== rw || h !== rh) {
     rw = w; rh = h;
-    canvas.width = w; canvas.height = h;
     img = new ImageData(w, h);
-    resetAccum();
+    samples = new Float32Array(w * h * 8);
   }
   frameId++;
   lastDispatch = performance.now();
-  const blend = still ? 0 : 0.55;
+  dispCam = camSnapshot(w, h);
   const packed = workers.some((wk) => sentVersion.get(wk) !== sceneVersion) ? packScene(scene) : null;
   workers.forEach((wk, i) => {
     const msg = {
-      type: 'frame', id: frameId, w, h, row0: i, step: N, frame, blend, sky: skyMode, exposure,
+      type: 'frame', id: frameId, w, h, row0: i, step: N, frame, sky: skyMode,
       cam: [cam.p[0], cam.p[1], cam.p[2], cam.yaw, cam.pitch, cam.fov],
     };
     if (sentVersion.get(wk) !== sceneVersion) {
@@ -451,7 +565,7 @@ function updateStats(now) {
   samplesWindow = 0; fpsWindow = 0; statT = now;
   $('stats').textContent =
     `${fps.toFixed(1)} fps · ${(pathsPerSec / 1e6).toFixed(2)} M paths/s\n` +
-    `${rw}×${rh} · ${still ? Math.min(frame, maxSpp) + ' spp' : 'moving'}\n` +
+    `${rw}×${rh} · ${still ? 'still' : 'moving'} · ${Math.round(centerSpp)} spp\n` +
     `${N} workers${arch ? ' · ' + arch : ''} · ${scene.length} objects · ${SKY_NAMES[skyMode]}`;
 }
 
@@ -478,7 +592,6 @@ function tick(now) {
   }
   const wasStill = still;
   still = now - lastMove > 220;
-  if (still && !wasStill) resetAccum();
   maybeDispatch();
   drawGhost();
   updateStats(now);

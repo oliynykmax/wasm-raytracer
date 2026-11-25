@@ -83,6 +83,7 @@
   .mbtn.small { width: 44px; height: 44px; font-size: 16px; }
   .mbtn:active { background: rgba(255,211,77,.4); }
   body.touch .slot { width: 40px; height: 40px; padding: 2px; border-width: 2px; }
+  @media (max-height: 500px), (max-width: 600px) { #help, #hud .row:first-of-type { display: none; } #hud { font-size: 10.5px; padding: 7px 9px; max-width: 250px; } #hud h1 { font-size: 11px; } }
   @media (max-width: 420px) { body.touch .slot { width: 36px; height: 36px; } #hud { font-size: 11px; } }
 </style>
 </head>
@@ -98,7 +99,7 @@
   <div id="stats">starting…</div>
   <div id="help">
     <span class="desk">WASD fly · Space/Shift up/down · Ctrl fast<br>LMB place · RMB break · 1–9/wheel pick<br>T sky · R reset · H hide</span>
-    <span class="mob">Left thumb move · drag to look<br>+ place · × break · ☀ sky</span>
+    <span class="mob">Left thumb move · drag to look<br>+ place · − break · ☀ sky</span>
   </div>
 </div>
 
@@ -112,7 +113,7 @@
 <div id="stick" class="mobctl"><div id="knob"></div></div>
 <div id="btns" class="mobctl">
   <div class="pair"><button class="mbtn small" id="btn-reset" aria-label="Reset scene">↺</button><button class="mbtn small" id="btn-sky" aria-label="Change sky">☀</button></div>
-  <div class="pair"><button class="mbtn" id="btn-break" aria-label="Break">×</button><button class="mbtn" id="btn-place" aria-label="Place">+</button></div>
+  <div class="pair"><button class="mbtn" id="btn-break" aria-label="Break">−</button><button class="mbtn" id="btn-place" aria-label="Place">+</button></div>
   <div class="pair"><button class="mbtn small" id="btn-down" aria-label="Fly down">▼</button><button class="mbtn small" id="btn-up" aria-label="Fly up">▲</button></div>
 </div>
 

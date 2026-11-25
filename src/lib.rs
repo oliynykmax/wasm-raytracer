@@ -122,8 +122,7 @@ static mut OBJS: Vec<Obj> = Vec::new();
 static mut ORDER: Vec<u32> = Vec::new();
 static mut NODES: Vec<Node> = Vec::new();
 static mut LIGHTS: Vec<u32> = Vec::new();
-static mut ACC: Vec<f32> = Vec::new();
-static mut OUT: Vec<u8> = Vec::new();
+static mut OUT: Vec<f32> = Vec::new();
 static mut PICK: [f32; 8] = [0.0; 8];
 static mut SKY: Sky = SKIES[0];
 
@@ -556,7 +555,9 @@ fn direct(p: V, n: V, r: &mut Rng) -> V {
     c
 }
 
-fn trace(mut ro: V, mut rd: V, r: &mut Rng) -> V {
+/// `first` receives the primary hit position and 1.0, or the ray direction and 0.0 for sky.
+fn trace(mut ro: V, mut rd: V, r: &mut Rng, first: &mut (V, f32)) -> V {
+    *first = (rd, 0.0);
     let mut thr = v(1.0, 1.0, 1.0);
     let mut col = V::default();
     let mut specular = true;
@@ -567,6 +568,9 @@ fn trace(mut ro: V, mut rd: V, r: &mut Rng) -> V {
             break;
         }
         let p = ro + rd * h.t;
+        if depth == 0 {
+            *first = (p, 1.0);
+        }
         let front = rd.dot(h.n) < 0.0;
         let nl = if front { h.n } else { -h.n };
         let (alb, mat, rough, ior, emit, is_light) = if h.id == FLOOR {
@@ -661,14 +665,9 @@ fn trace(mut ro: V, mut rd: V, r: &mut Rng) -> V {
     col
 }
 
-fn aces(x: f32) -> f32 {
-    ((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)).clamp(0.0, 1.0)
-}
-
-/// Render rows `row0, row0 + step, ...` of a `w`×`h` image.
-/// `frame` 0 resets the accumulation buffer; `blend` is the minimum weight for the
-/// new sample (0 for a true progressive average, higher while the camera moves).
-/// Returns a pointer to RGBA8 pixels for just those rows.
+/// Trace one sample per pixel for rows `row0, row0 + step, ...` of a `w`×`h` image.
+/// Returns 8 floats per pixel: linear RGB, 0, then the primary hit position and 1,
+/// or the ray direction and 0 for sky. The host reprojects and accumulates.
 #[no_mangle]
 pub extern "C" fn render(
     w: u32,
@@ -676,7 +675,6 @@ pub extern "C" fn render(
     row0: u32,
     step: u32,
     frame: u32,
-    blend: f32,
     px: f32,
     py: f32,
     pz: f32,
@@ -684,17 +682,13 @@ pub extern "C" fn render(
     pitch: f32,
     fov: f32,
     sky_mode: u32,
-    exposure: f32,
-) -> *const u8 {
+) -> *const f32 {
     unsafe {
         SKY = SKIES[(sky_mode as usize).min(SKIES.len() - 1)];
         let rows = if row0 >= h { 0 } else { (h - row0 + step - 1) / step } as usize;
         let n = rows * w as usize;
-        if ACC.len() != n * 3 {
-            ACC = vec![0.0; n * 3];
-        }
-        if OUT.len() != n * 4 {
-            OUT = vec![255; n * 4];
+        if OUT.len() != n * 8 {
+            OUT = vec![0.0; n * 8];
         }
         let eye = v(px, py, pz);
         let fwd = v(pitch.cos() * yaw.sin(), pitch.sin(), -pitch.cos() * yaw.cos());
@@ -702,7 +696,7 @@ pub extern "C" fn render(
         let up = right.cross(fwd);
         let th = (fov * 0.5).tan();
         let aspect = w as f32 / h as f32;
-        let wt = if frame == 0 { 1.0 } else { (1.0 / (frame as f32 + 1.0)).max(blend) };
+        let mut first = (V::default(), 0.0);
         for ri in 0..rows {
             let y = row0 as usize + ri * step as usize;
             for x in 0..w as usize {
@@ -712,15 +706,8 @@ pub extern "C" fn render(
                 let sx = ((x as f32 + rng.f()) / w as f32 * 2.0 - 1.0) * th * aspect;
                 let sy = (1.0 - (y as f32 + rng.f()) / h as f32 * 2.0) * th;
                 let rd = (fwd + right * sx + up * sy).norm();
-                let c = trace(eye, rd, &mut rng);
-                let a = &mut ACC[idx * 3..idx * 3 + 3];
-                a[0] += (c.x - a[0]) * wt;
-                a[1] += (c.y - a[1]) * wt;
-                a[2] += (c.z - a[2]) * wt;
-                let o = &mut OUT[idx * 4..idx * 4 + 4];
-                o[0] = (aces(a[0] * exposure).powf(1.0 / 2.2) * 255.0) as u8;
-                o[1] = (aces(a[1] * exposure).powf(1.0 / 2.2) * 255.0) as u8;
-                o[2] = (aces(a[2] * exposure).powf(1.0 / 2.2) * 255.0) as u8;
+                let c = trace(eye, rd, &mut rng, &mut first);
+                OUT[idx * 8..idx * 8 + 8].copy_from_slice(&[c.x, c.y, c.z, 0.0, first.0.x, first.0.y, first.0.z, first.1]);
             }
         }
         OUT.as_ptr()
