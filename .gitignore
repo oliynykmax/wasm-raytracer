@@ -1,0 +1,3 @@
+target
+web/raytracer.wasm
+.wrangler

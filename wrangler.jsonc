@@ -1,0 +1,6 @@
+{
+  "name": "game-pathtracer",
+  "compatibility_date": "2026-11-01",
+  "assets": { "directory": "./web" },
+  "routes": [{ "pattern": "game.oliinyk.dev", "custom_domain": true }]
+}
